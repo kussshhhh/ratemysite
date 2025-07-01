@@ -4,38 +4,37 @@
   "description": "Floating prompt box for AI chat interfaces",
   "version": "1.0",
   "permissions": [
-    "storage",
-    "activeTab"
+      "storage",
+      "activeTab"
   ],
   "action": {
-    "default_icon": {
+      "default_icon": {
+          "16": "icons/icon16.png",
+          "48": "icons/icon48.png",
+          "128": "icons/icon128.png"
+      }
+  },
+  "background": {
+      "service_worker": "background.js"
+  },
+  "content_scripts": [
+      {
+          "matches": [
+              "https://claude.ai/*",
+              "https://chat.openai.com/*",
+              "https://gemini.google.com/*",
+              "https://www.perplexity.ai/*",
+              "https://chat.deepseek.com/*",
+              "https://console.groq.com/*"
+          ],
+          "js": ["storage.js", "ngram.js", "content.js", "autocomplete.js"],
+          "css": ["styles.css"],
+          "run_at": "document_end"
+      }
+  ],
+  "icons": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    }
-  },
-  "background": {
-    "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://claude.ai/*",
-        "https://chat.openai.com/*",
-        "https://gemini.google.com/*",
-        "https://www.perplexity.ai/*",
-        "https://chat.deepseek.com/*",
-        "https://console.groq.com/*"
-      ],
-      "js": ["content.js", "autocomplete.js"],
-      "css": ["styles.css"],
-      "run_at": "document_end"
-
-    }
-  ],
-  "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
   }
 }

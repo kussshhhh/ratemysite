@@ -6,57 +6,64 @@ class TrieNode {
         this.originalWord = '';
     }
 }
-// Enhanced search engine with Trie and fuzzy search
+
 class AutocompleteEngine {
     constructor() {
         this.trie = new TrieNode();
         this.fuzzyThreshold = 0.3;
+        this.predictor = new NGramPredictor(); // N-gram predictor
         this.initialize();
         this.setupStorageListener();
     }
 
     async initialize() {
         try {
-            const { prompts } = await chrome.storage.sync.get('prompts');
+            const prompts = await storage.get(storage.stores.settings, 'prompts');
             if (!prompts) {
-                console.log('No prompts found in storage');
-                return;
+                // No prompts found, proceed silently
+            } else {
+                const allPrompts = [...(prompts.global || []), ...(prompts.local || [])];
+                this.buildTrie(allPrompts);
             }
-            const allPrompts = [...(prompts.global || []), ...(prompts.local || [])];
-            this.buildTrie(allPrompts);
+            await this.predictor.initialize();
         } catch (error) {
-            console.error('Error initializing autocomplete engine:', error);
+            console.error('AutocompleteEngine: Error initializing:', error);
         }
     }
 
     setupStorageListener() {
-        chrome.storage.onChanged.addListener((changes, namespace) => {
-            if (namespace === 'sync' && changes.prompts) {
-                const allPrompts = [
-                    ...(changes.prompts.newValue.global || []),
-                    ...(changes.prompts.newValue.local || [])
-                ];
-                this.buildTrie(allPrompts);
+        // Custom storage change listener for IndexedDB
+        // We'll trigger updates when the PromptBox saves state
+        window.addEventListener('promptsUpdated', async (event) => {
+            try {
+                const prompts = await storage.get(storage.stores.settings, 'prompts');
+                if (prompts) {
+                    const allPrompts = [
+                        ...(prompts.global || []),
+                        ...(prompts.local || [])
+                    ];
+                    this.buildTrie(allPrompts);
+                }
+            } catch (error) {
+                console.error('AutocompleteEngine: Error updating from storage:', error);
             }
         });
     }
 
     buildTrie(prompts) {
-        this.trie = new TrieNode(); // Reset trie
+        this.trie = new TrieNode();
         prompts.forEach(prompt => this.insert(prompt));
     }
 
     insert(prompt) {
         let node = this.trie;
         const word = prompt.text.toLowerCase();
-        
         for (const char of word) {
             if (!node.children.has(char)) {
                 node.children.set(char, new TrieNode());
             }
             node = node.children.get(char);
         }
-        
         node.isEndOfWord = true;
         node.prompt = prompt;
         node.originalWord = word;
@@ -65,10 +72,8 @@ class AutocompleteEngine {
     levenshteinDistance(str1, str2) {
         const matrix = Array(str2.length + 1).fill(null)
             .map(() => Array(str1.length + 1).fill(null));
-
         for (let i = 0; i <= str1.length; i++) matrix[0][i] = i;
         for (let j = 0; j <= str2.length; j++) matrix[j][0] = j;
-
         for (let j = 1; j <= str2.length; j++) {
             for (let i = 1; i <= str1.length; i++) {
                 const substitutionCost = str1[i - 1] === str2[j - 1] ? 0 : 1;
@@ -79,60 +84,51 @@ class AutocompleteEngine {
                 );
             }
         }
-
         return matrix[str2.length][str1.length];
     }
 
     getAllWords(node = this.trie, prefix = '', words = []) {
         if (node.isEndOfWord) {
-            words.push({
-                prompt: node.prompt,
-                word: node.originalWord,
-                prefix: prefix
-            });
+            words.push({ prompt: node.prompt, word: node.originalWord, prefix });
         }
-
         for (const [char, childNode] of node.children) {
             this.getAllWords(childNode, prefix + char, words);
         }
-
         return words;
     }
 
-   search(query) {
+    search(query) {
         if (!query) return [];
         query = query.toLowerCase();
 
-        // Generate all possible prefixes
         const prefixes = [];
         const words = query.split(' ');
-        let currentPhrase = '';
-
-        // Get full phrase prefixes
         for (let i = 0; i < query.length; i++) {
             prefixes.push(query.slice(i));
         }
-
-        // Get word-based prefixes
         for (let i = 0; i < words.length; i++) {
             const phrase = words.slice(i).join(' ');
-            // Get all prefixes of this phrase
             for (let j = 0; j < phrase.length; j++) {
                 prefixes.push(phrase.slice(j));
             }
         }
 
-        // Get prefix matches for each possible prefix
-        const prefixMatches = prefixes
-            .map(prefix => this.searchPrefix(prefix))
-            .flat();
-
-        // Get fuzzy matches
+        const prefixMatches = prefixes.map(prefix => this.searchPrefix(prefix)).flat();
         const fuzzyMatches = this.searchFuzzy(query);
 
-        // Combine and deduplicate
+        let ngramMatches = [];
+        try {
+            ngramMatches = this.predictor.predict(query).map(pred => ({
+                prompt: { text: pred.text, type: 'ngram' },
+                matchType: 'ngram',
+                score: pred.probability
+            }));
+        } catch (error) {
+            console.error('AutocompleteEngine: N-gram prediction failed:', error);
+        }
+
         const seen = new Set();
-        const allMatches = [...prefixMatches, ...fuzzyMatches]
+        const allMatches = [...prefixMatches, ...fuzzyMatches, ...ngramMatches]
             .filter(match => {
                 const id = match.prompt.text;
                 if (seen.has(id)) return false;
@@ -140,15 +136,9 @@ class AutocompleteEngine {
                 return true;
             })
             .sort((a, b) => {
-                // First prioritize prefix matches over fuzzy matches
                 if (a.matchType !== b.matchType) {
-                    return a.matchType === 'prefix' ? -1 : 1;
+                    return a.matchType === 'prefix' ? -1 : (a.matchType === 'fuzzy' ? 0 : 1);
                 }
-                // For prefix matches, prioritize by length of match
-                if (a.matchType === 'prefix' && b.matchType === 'prefix') {
-                    return b.score - a.score;
-                }
-                // For fuzzy matches, use the similarity score
                 return b.score - a.score;
             });
 
@@ -158,14 +148,10 @@ class AutocompleteEngine {
     searchPrefix(prefix) {
         let node = this.trie;
         const results = [];
-        
-        // Navigate to prefix node
         for (const char of prefix) {
             if (!node.children.has(char)) return [];
             node = node.children.get(char);
         }
-
-        // Collect all words under this node, including the prefix length as score
         this.collectWords(node, prefix, results, prefix.length);
         return results;
     }
@@ -173,40 +159,26 @@ class AutocompleteEngine {
     searchFuzzy(query) {
         const allWords = this.getAllWords();
         const results = [];
-
-        allWords.forEach(({prompt, word}) => {
+        allWords.forEach(({ prompt, word }) => {
             const distance = this.levenshteinDistance(query, word);
             const maxLength = Math.max(query.length, word.length);
             const similarity = 1 - (distance / maxLength);
-
             if (similarity > this.fuzzyThreshold) {
-                results.push({
-                    prompt,
-                    matchType: 'fuzzy',
-                    score: similarity
-                });
+                results.push({ prompt, matchType: 'fuzzy', score: similarity });
             }
         });
-
         return results;
     }
 
     collectWords(node, prefix, results, prefixLength) {
         if (node.isEndOfWord) {
-            results.push({
-                prompt: node.prompt,
-                matchType: 'prefix',
-                score: prefixLength  // Use the length of the matching prefix as score
-            });
+            results.push({ prompt: node.prompt, matchType: 'prefix', score: prefixLength });
         }
-    
         for (const [char, childNode] of node.children) {
             this.collectWords(childNode, prefix + char, results, prefixLength);
         }
     }
-
 }
-
 
 class PromptAutocomplete {
     constructor() {
@@ -222,44 +194,30 @@ class PromptAutocomplete {
         this.initialY = 0;
         this.xOffset = 0;
         this.yOffset = 0;
-        
         this.searchEngine = new AutocompleteEngine();
-
-        // Initialize after constructor
+        console.log('PromptAutocomplete: Action performed');
         setTimeout(() => this.initialize(), 0);
     }
 
     initialize() {
-        console.log('Initializing prompt autocomplete...');
-        
-        // Create suggestions container first
+        console.log('PromptAutocomplete: Action performed');
         this.createSuggestionsContainer();
-        
-        // Try to find the input element
         const inputElement = document.querySelector('.ProseMirror[contenteditable="true"]');
         if (inputElement) {
-            console.log('Found input element immediately');
             this.setupAutocomplete(inputElement);
         }
-
-        // Set up observer for dynamic loading
         const observer = new MutationObserver((mutations, obs) => {
             const inputElement = document.querySelector('.ProseMirror[contenteditable="true"]');
             if (inputElement && !this.inputElement) {
-                console.log('Found input element via observer');
                 this.setupAutocomplete(inputElement);
                 this.positionBelowInput();
             }
         });
-
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     createGhostOverlay() {
-        // Create ghost overlay element
+        console.log('PromptAutocomplete: Action performed');
         this.ghostOverlay = document.createElement('div');
         Object.assign(this.ghostOverlay.style, {
             position: 'absolute',
@@ -274,116 +232,105 @@ class PromptAutocomplete {
         });
         document.body.appendChild(this.ghostOverlay);
     }
-    
+
     updateGhostOverlay() {
+        console.log('PromptAutocomplete: Action performed');
         if (!this.inputElement || !this.ghostOverlay || this.currentSuggestions.length === 0) {
             if (this.ghostOverlay) {
                 this.ghostOverlay.style.visibility = 'hidden';
             }
             return;
         }
-    
+
         const currentContent = this.inputElement.textContent.trim();
-        const suggestion = this.currentSuggestions[0];
-    
-        // Find the common prefix
-        const { endIndex } = this.findLongestCommonSuffixPrefix(
-            currentContent.toLowerCase(),
-            suggestion.text.toLowerCase()
-        );
-    
-        // Get the ghost text (remaining part of suggestion)
-        let ghostText = suggestion.text.slice(endIndex).trim();
-        
-        // Limit to at most 3 words
-        const words = ghostText.split(/\s+/);
-        ghostText = words.slice(0, 3).join(' ');
-    
+        const words = currentContent.split(/\s+/);
+        const currentWord = words[words.length - 1] || '';
+        const context = words.slice(0, -1).join(' ') || '';
+
+        const topSuggestion = this.currentSuggestions[0];
+        let ghostText = '';
+
+        let wordPrediction = '';
+        try {
+            const ngramPredictions = this.searchEngine.predictor.predict(context.trim() || currentWord);
+            if (ngramPredictions.length > 0) {
+                const predictedFullText = ngramPredictions[0].text;
+                const predictedWords = predictedFullText.split(/\s+/);
+                const lastPredictedWord = predictedWords[predictedWords.length - 1];
+                if (lastPredictedWord.startsWith(currentWord.toLowerCase())) {
+                    wordPrediction = lastPredictedWord.slice(currentWord.length);
+                }
+            }
+        } catch (error) {
+            console.error('PromptAutocomplete: Error predicting word with N-gram:', error);
+        }
+
+        if (wordPrediction) {
+            ghostText = wordPrediction;
+        } else if (topSuggestion) {
+            const { endIndex } = this.findLongestCommonSuffixPrefix(currentContent.toLowerCase(), topSuggestion.text.toLowerCase());
+            ghostText = topSuggestion.text.slice(endIndex).trim();
+            const ghostWords = ghostText.split(/\s+/);
+            ghostText = ghostWords.slice(0, 3).join(' ');
+        }
+
         if (!ghostText) {
             this.ghostOverlay.style.visibility = 'hidden';
             return;
         }
-    
-        // Position the ghost overlay
-        const rect = this.inputElement.getBoundingClientRect();
+
         const selection = window.getSelection();
-        let range;
-    
-        if (selection.rangeCount > 0) {
-            range = selection.getRangeAt(0).cloneRange();
-        } else {
-            range = document.createRange();
-            range.selectNodeContents(this.inputElement);
-            range.collapse(false);
-        }
-    
+        let range = selection.rangeCount > 0 ? selection.getRangeAt(0).cloneRange() : document.createRange();
+        range.selectNodeContents(this.inputElement);
+        range.collapse(false);
+
         const tempSpan = document.createElement('span');
         range.insertNode(tempSpan);
         const spanRect = tempSpan.getBoundingClientRect();
         tempSpan.remove();
-    
+
         Object.assign(this.ghostOverlay.style, {
             top: `${spanRect.top}px`,
             left: `${spanRect.left}px`,
             visibility: 'visible'
         });
-    
         this.ghostOverlay.textContent = ghostText;
     }
-    
 
     findLongestCommonSuffixPrefix(str1, str2) {
         let maxLength = 0;
         let endIndex = 0;
-        
         for (let i = 1; i <= Math.min(str1.length, str2.length); i++) {
             const suffix = str1.slice(-i);
             const prefix = str2.slice(0, i);
-
             if (suffix === prefix) {
                 maxLength = i;
                 endIndex = i;
             }
         }
-
-        return {
-            commonLength: maxLength,
-            endIndex: endIndex
-        };
+        return { commonLength: maxLength, endIndex };
     }
 
     createSuggestionsContainer() {
+        console.log('PromptAutocomplete: Action performed');
         try {
-            // Remove existing container if any
             const existingContainer = document.querySelector('.prompt-suggestions');
             if (existingContainer) {
                 existingContainer.remove();
             }
-
-            // Create main container
             this.suggestionsContainer = document.createElement('div');
             this.suggestionsContainer.className = 'prompt-suggestions';
-
-            // Create header
             const header = document.createElement('div');
             header.className = 'suggestions-header';
             header.textContent = 'Suggestions';
-
-            // Create content container
             this.contentContainer = document.createElement('div');
             this.contentContainer.className = 'suggestions-content';
-
-            // Add empty state
             const emptyState = document.createElement('div');
             emptyState.className = 'empty-state';
             emptyState.textContent = 'No suggestions available';
-
-            // Build structure
             this.contentContainer.appendChild(emptyState);
             this.suggestionsContainer.appendChild(header);
             this.suggestionsContainer.appendChild(this.contentContainer);
-
-            // Apply styles
             Object.assign(this.suggestionsContainer.style, {
                 position: 'fixed',
                 top: '100px',
@@ -401,7 +348,6 @@ class PromptAutocomplete {
                 fontFamily: 'Arial, sans-serif',
                 overflow: 'hidden'
             });
-
             Object.assign(header.style, {
                 padding: '8px 12px',
                 borderBottom: '1px solid #ddd',
@@ -410,27 +356,19 @@ class PromptAutocomplete {
                 cursor: 'move',
                 userSelect: 'none'
             });
-
             Object.assign(this.contentContainer.style, {
                 overflowY: 'auto',
                 maxHeight: '250px',
                 padding: '8px 0'
             });
-
             Object.assign(emptyState.style, {
                 padding: '12px',
                 color: '#666',
                 textAlign: 'center',
                 fontStyle: 'italic'
             });
-
-            // Add to document
             document.body.appendChild(this.suggestionsContainer);
-
-            // Setup dragging
             this.setupDragging(header);
-
-            // Add click handler to document
             document.addEventListener('click', (e) => {
                 if (this.suggestionsContainer && 
                     !this.suggestionsContainer.contains(e.target) && 
@@ -438,13 +376,13 @@ class PromptAutocomplete {
                     this.updateSuggestions();
                 }
             });
-
         } catch (error) {
-            console.error('Error creating suggestions container:', error);
+            console.error('PromptAutocomplete: Error creating suggestions container:', error);
         }
     }
 
     setupDragging(dragHandle) {
+        console.log('PromptAutocomplete: Action performed');
         const dragStart = (e) => {
             if (e.type === "touchstart") {
                 this.initialX = e.touches[0].clientX - this.xOffset;
@@ -453,20 +391,14 @@ class PromptAutocomplete {
                 this.initialX = e.clientX - this.xOffset;
                 this.initialY = e.clientY - this.yOffset;
             }
-            
-            if (e.target === dragHandle) {
-                this.isDragging = true;
-            }
+            if (e.target === dragHandle) this.isDragging = true;
         };
-
         const dragEnd = () => {
             this.isDragging = false;
         };
-
         const drag = (e) => {
             if (this.isDragging && this.suggestionsContainer) {
                 e.preventDefault();
-                
                 if (e.type === "touchmove") {
                     this.currentX = e.touches[0].clientX - this.initialX;
                     this.currentY = e.touches[0].clientY - this.initialY;
@@ -474,15 +406,11 @@ class PromptAutocomplete {
                     this.currentX = e.clientX - this.initialX;
                     this.currentY = e.clientY - this.initialY;
                 }
-
                 this.xOffset = this.currentX;
                 this.yOffset = this.currentY;
-
-                this.suggestionsContainer.style.transform = 
-                    `translate(${this.currentX}px, ${this.currentY}px)`;
+                this.suggestionsContainer.style.transform = `translate(${this.currentX}px, ${this.currentY}px)`;
             }
         };
-
         dragHandle.addEventListener('touchstart', dragStart, false);
         dragHandle.addEventListener('mousedown', dragStart, false);
         document.addEventListener('touchend', dragEnd, false);
@@ -492,73 +420,64 @@ class PromptAutocomplete {
     }
 
     positionBelowInput() {
+        console.log('PromptAutocomplete: Action performed');
         if (this.inputElement && this.suggestionsContainer) {
             const rect = this.inputElement.getBoundingClientRect();
             this.suggestionsContainer.style.top = `${rect.bottom + 5}px`;
             this.suggestionsContainer.style.left = `${rect.left}px`;
-            // Reset transform when positioning below input
             this.suggestionsContainer.style.transform = 'none';
             this.xOffset = 0;
             this.yOffset = 0;
+        } else {
+            console.warn('PromptAutocomplete: Input or container missing for positioning');
         }
     }
 
-  
-
     setupAutocomplete(inputElement) {
+        console.log('PromptAutocomplete: Action performed');
         this.inputElement = inputElement;
-        this.createGhostOverlay() ;
-        
-        // Handle input events with debouncing
+        this.createGhostOverlay();
         let debounceTimeout;
         inputElement.addEventListener('input', async (e) => {
             clearTimeout(debounceTimeout);
             debounceTimeout = setTimeout(() => {
                 const content = e.target.textContent;
-                
                 if (content === this.lastContent) return;
                 this.lastContent = content;
-
                 try {
-                    // Use the new search engine instead of the old filterPrompts
                     this.currentSuggestions = this.searchEngine.search(content);
-                    console.log('Found suggestions:', this.currentSuggestions);
                     this.updateSuggestions();
-                    this.updateGhostOverlay() ;
+                    this.updateGhostOverlay();
                 } catch (error) {
-                    console.error('Error getting suggestions:', error);
+                    console.error('PromptAutocomplete: Error getting suggestions:', error);
                     this.currentSuggestions = [];
                     this.updateSuggestions();
-                    this.updateGhostOverlay() ;
+                    this.updateGhostOverlay();
                 }
             }, 150);
         });
-
         document.addEventListener('selectionchange', () => {
             if (this.currentSuggestions.length > 0) {
                 this.updateGhostOverlay();
             }
         });
-
-        // Handle keyboard navigation
         inputElement.addEventListener('keydown', (e) => {
             if (!this.currentSuggestions.length) return;
-            
             if (e.key === 'Tab') {
-                if (this.currentSuggestions.length > 0) {
-                    e.preventDefault();
-                    this.completeSuggestion(this.currentSuggestions[0]);
-                    this.updateGhostOverlay() ;
-                }
+                e.preventDefault();
+                this.completeSuggestion(this.currentSuggestions[0]);
+                this.updateGhostOverlay();
             }
-        }); 
+        });
     }
 
     updateSuggestions() {
-        if (!this.contentContainer) return;
-        
+        console.log('PromptAutocomplete: Action performed');
+        if (!this.contentContainer) {
+            console.warn('PromptAutocomplete: Content container missing');
+            return;
+        }
         this.contentContainer.innerHTML = '';
-
         if (this.currentSuggestions.length === 0) {
             const emptyState = document.createElement('div');
             emptyState.className = 'empty-state';
@@ -572,7 +491,6 @@ class PromptAutocomplete {
             this.contentContainer.appendChild(emptyState);
             return;
         }
-
         this.currentSuggestions.forEach((suggestion) => {
             const div = document.createElement('div');
             Object.assign(div.style, {
@@ -582,85 +500,42 @@ class PromptAutocomplete {
                 backgroundColor: 'white',
                 transition: 'background-color 0.2s'
             });
-            
             const matchingPart = suggestion.text.substring(0, this.lastContent.length);
             const remainingPart = suggestion.text.substring(this.lastContent.length);
             div.innerHTML = `<strong>${matchingPart}</strong>${remainingPart}`;
-
-            div.addEventListener('click', () => {
-                this.completeSuggestion(suggestion);
-            });
-
-            div.addEventListener('mouseenter', () => {
-                div.style.backgroundColor = '#f0f0f0';
-            });
-            div.addEventListener('mouseleave', () => {
-                div.style.backgroundColor = 'white';
-            });
-
+            div.addEventListener('click', () => this.completeSuggestion(suggestion));
+            div.addEventListener('mouseenter', () => { div.style.backgroundColor = '#f0f0f0'; });
+            div.addEventListener('mouseleave', () => { div.style.backgroundColor = 'white'; });
             this.contentContainer.appendChild(div);
         });
     }
 
     completeSuggestion(suggestion) {
-        if (!this.inputElement) return;
-        
+        console.log('PromptAutocomplete: Action performed');
+        if (!this.inputElement) {
+            console.warn('PromptAutocomplete: No input element to complete suggestion');
+            return;
+        }
         const currentContent = this.inputElement.textContent.trim();
         const suggestionText = suggestion.text.trim();
-
-        // Function to find the longest common suffix-prefix
-        const findLongestCommonSuffixPrefix = (str1, str2) => {
-            let maxLength = 0;
-            let endIndex = 0;
-
-            // Check each possible suffix of str1 against prefix of str2
-            for (let i = 1; i <= Math.min(str1.length, str2.length); i++) {
-                const suffix = str1.slice(-i);
-                const prefix = str2.slice(0, i);
-
-                if (suffix === prefix) {
-                    maxLength = i;
-                    endIndex = i;
-                }
-            }
-
-            return {
-                commonLength: maxLength,
-                endIndex: endIndex
-            };
-        };
-
-        // Find the overlap
-        const { commonLength, endIndex } = findLongestCommonSuffixPrefix(
-            currentContent.toLowerCase(), 
-            suggestionText.toLowerCase()
-        );
-
-        // Construct the final string by removing the overlap
+        const { endIndex } = this.findLongestCommonSuffixPrefix(currentContent.toLowerCase(), suggestionText.toLowerCase());
         const finalString = currentContent + suggestionText.slice(endIndex);
-
-        console.log('Current content:', currentContent);
-        console.log('Suggestion to append:', suggestionText);
-        console.log('Overlap length:', commonLength);
-        console.log('Final string:', finalString);
-
-        // Update the input with the new content
         this.inputElement.innerHTML = `<p>${finalString}</p>`;
-
-        
-        // Move cursor to end
         const selection = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(this.inputElement);
         range.collapse(false);
         selection.removeAllRanges();
         selection.addRange(range);
-
-        // Clear suggestions but keep box visible
+        try {
+            this.searchEngine.predictor.train(finalString);
+            this.searchEngine.predictor.saveToStorage();
+        } catch (error) {
+            console.error('PromptAutocomplete: Failed to train N-gram:', error);
+        }
         this.currentSuggestions = [];
         this.updateSuggestions();
     }
 }
 
-// Initialize the autocomplete
 const promptAutocomplete = new PromptAutocomplete();
